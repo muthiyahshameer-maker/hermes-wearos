@@ -1,6 +1,7 @@
 package dev.hermes.wearos.ui.md
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -141,6 +142,22 @@ class WatchMarkdownTest {
     @Test fun tableDegradesToLabelledLines() {
         val t = WatchMarkdown.parse("| lang | year |\n|------|------|\n| kotlin | 2011 |")[0] as MdBlock.Table
         assertEquals(listOf("· lang: kotlin", "· year: 2011"), t.lines)
+    }
+
+    @Test fun twoColumnLabelledTableIsGridable() {
+        val t = WatchMarkdown.parse("| lang | year |\n|------|------|\n| kotlin | 2011 |\n| rust | 2010 |")[0] as MdBlock.Table
+        assertTrue(t.gridable)
+        assertEquals(listOf("lang", "year"), t.header)
+        assertEquals(listOf(listOf("kotlin", "2011"), listOf("rust", "2010")), t.rows)
+    }
+
+    @Test fun wideHeaderlessOrStreamingTablesStayDegraded() {
+        val wide = WatchMarkdown.parse("| a | b | c |\n|---|---|---|\n| 1 | 2 | 3 |")[0] as MdBlock.Table
+        assertFalse(wide.gridable)
+        val noHeader = WatchMarkdown.parse("| kotlin | 2011 |")[0] as MdBlock.Table
+        assertFalse(noHeader.gridable)
+        val streaming = WatchMarkdown.parse("| lang | year |\n|---|---|")[0] as MdBlock.Table
+        assertFalse(streaming.gridable) // header-only mid-stream: no rows yet
     }
 
     /** Never lose text: unterminated markers render as literal characters. */

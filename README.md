@@ -28,7 +28,7 @@ encrypted and bounded. It's the "own your stack" demo that lives on your wrist.
 | | |
 |---|---|
 | <img src="docs/screens/02-chat-markdown.png" width="180"/> | <img src="docs/screens/08-sessions.png" width="180"/> |
-| **Streaming markdown**, rendered for a round screen: headings, bold, bullets, numbered lists, tap-to-expand code chips, and tables (rendered as readable rows — on 1.4 inches, a grid of pipes is a crime). Pinch to scale text (double-tap resets); media keeps its own zoom. | **Sessions, from your wrist** — browse and adopt desktop/server sessions (`💻`), with their history backfilled; filters, resume, one-tap new. |
+| **Streaming markdown**, rendered for a round screen: headings, bold, bullets, numbered lists, tap-to-expand code chips, and real two-column tables (bold header, hairline, aligned cells) — wider tables degrade to readable rows, because a grid of pipes on 1.4 inches is a crime. Pinch to scale text (double-tap resets); media keeps its own zoom. | **Sessions, from your wrist** — browse and adopt desktop/server sessions (`💻`), with their history backfilled; filters, resume, one-tap new. |
 | <img src="docs/screens/03-image-card.png" width="180"/> | <img src="docs/screens/04-viewer-zoom.png" width="180"/> |
 | **Images at full resolution** — the agent draws, the watch decodes and shows it. Tap to open the viewer. | **Zoom viewer** — double-tap or pinch to zoom, drag to pan below fit, tap anywhere to close. |
 | <img src="docs/screens/06-ptt-overlay.png" width="180"/> | <img src="docs/screens/07-stop-running.png" width="180"/> |

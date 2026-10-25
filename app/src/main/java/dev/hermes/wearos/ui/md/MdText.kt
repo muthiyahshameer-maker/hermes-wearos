@@ -99,7 +99,40 @@ fun MdBlockView(block: MdBlock, blockKey: Any, modifier: Modifier = Modifier) {
 
         is MdBlock.Image -> ImageBlock(block.alt, block.target, blockKey, modifier)
 
-        is MdBlock.Table -> Column(modifier.fillMaxWidth()) {
+        is MdBlock.Table -> if (block.gridable) {
+            // True mini-grid for exactly-2 labelled columns: header + hairline + rows (F3 note).
+            Column(modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                Row(Modifier.fillMaxWidth()) {
+                    block.header.forEach { cell ->
+                        Text(
+                            WatchMarkdown.parseInline(cell).annotated(),
+                            modifier = Modifier.weight(1f).padding(horizontal = 4.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.caption1.scaled(),
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
+                Box(
+                    Modifier.fillMaxWidth().height(1.dp).padding(horizontal = 4.dp)
+                        .background(MaterialTheme.colors.onBackground.copy(alpha = 0.28f)),
+                )
+                block.rows.forEach { row ->
+                    Row(Modifier.fillMaxWidth()) {
+                        row.forEach { cell ->
+                            Text(
+                                WatchMarkdown.parseInline(cell).annotated(),
+                                modifier = Modifier.weight(1f).padding(horizontal = 4.dp, vertical = 2.dp),
+                                style = MaterialTheme.typography.caption2.scaled(),
+                                maxLines = 2,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                        }
+                    }
+                }
+            }
+        } else Column(modifier.fillMaxWidth()) {
             block.lines.forEach {
                 Text(
                     it,

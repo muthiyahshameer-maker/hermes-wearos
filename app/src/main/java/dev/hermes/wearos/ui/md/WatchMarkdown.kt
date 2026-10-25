@@ -33,9 +33,20 @@ sealed interface MdBlock {
 
     /**
      * Markdown tables degrade to pre-formatted "· col: cell" caption lines — the watch is too
-     * narrow for a real grid, so each non-blank cell becomes its own labelled line (F3 note).
+     * narrow for a wide grid, so each non-blank cell becomes its own labelled line (F3 note).
+     * Structured [header]/[rows] ride along: when the table is exactly two labelled columns
+     * ([gridable]) the renderer draws a real mini-grid instead — narrow tables DO fit a round
+     * screen, and a visible table beats a clever degradation in the common case.
      */
-    data class Table(val lines: List<String>) : MdBlock
+    data class Table(
+        val lines: List<String>,
+        val header: List<String> = emptyList(),
+        val rows: List<List<String>> = emptyList(),
+    ) : MdBlock {
+        val gridable: Boolean
+            get() = header.size == 2 && header.none { it.isBlank() } &&
+                rows.isNotEmpty() && rows.all { it.size == 2 }
+    }
     data object HrLine : MdBlock
 }
 
@@ -166,7 +177,7 @@ object WatchMarkdown {
                 }
                 // Header-only table (streaming just the first rows): show it unlabeled, not lost.
                 if (linesOut.isEmpty() && header.isNotEmpty()) header.forEach { if (it.isNotEmpty()) linesOut += "· $it" }
-                if (linesOut.isNotEmpty()) out += MdBlock.Table(linesOut)
+                if (linesOut.isNotEmpty()) out += MdBlock.Table(linesOut, header, body.map { it.first })
                 i = j; continue
             }
 
