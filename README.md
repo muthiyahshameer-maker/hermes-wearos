@@ -28,7 +28,7 @@ encrypted and bounded. It's the "own your stack" demo that lives on your wrist.
 | | |
 |---|---|
 | <img src="docs/screens/02-chat-markdown.png" width="180"/> | <img src="docs/screens/08-sessions.png" width="180"/> |
-| **Streaming markdown** — headings, bullets, code blocks, tables, rendered for a round screen. Pinch to scale text (double-tap resets); media keeps its own zoom. | **Sessions, from your wrist** — browse and adopt desktop/server sessions (`💻`), with their history backfilled; filters, resume, one-tap new. |
+| **Streaming markdown**, rendered for a round screen: headings, bold, bullets, numbered lists, tap-to-expand code chips, and tables (rendered as readable rows — on 1.4 inches, a grid of pipes is a crime). Pinch to scale text (double-tap resets); media keeps its own zoom. | **Sessions, from your wrist** — browse and adopt desktop/server sessions (`💻`), with their history backfilled; filters, resume, one-tap new. |
 | <img src="docs/screens/03-image-card.png" width="180"/> | <img src="docs/screens/04-viewer-zoom.png" width="180"/> |
 | **Images at full resolution** — the agent draws, the watch decodes and shows it. Tap to open the viewer. | **Zoom viewer** — double-tap or pinch to zoom, drag to pan below fit, tap anywhere to close. |
 | <img src="docs/screens/06-ptt-overlay.png" width="180"/> | <img src="docs/screens/07-stop-running.png" width="180"/> |
@@ -38,7 +38,7 @@ encrypted and bounded. It's the "own your stack" demo that lives on your wrist.
 
 Plus: a GBoard prompt editor for long asks (with a big `Send`), tap-any-old-message edit-and-resend,
 TTS that speaks every reply by default (mute satellite on the rim), gateway notifications with approve
-buttons, morning cron-brief relay onto the watch, and a diagnostics screen in Settings.
+buttons, and a diagnostics screen in Settings.
 
 ## Anatomy of a round trip
 
@@ -100,7 +100,10 @@ without touching a cloud voice. Mute is one satellite tap away.
 
 The watch holds an ordered list of gateway endpoints (e.g. `tailnet → LAN`) and probes every endpoint
 on a fixed cadence. First healthy endpoint wins, stays sticky, and every API call + image fetch rides
-the same winner so you never get split-brain rendering.
+the same winner so you never get split-brain rendering. Everything is visible and editable on the
+watch — Settings ▸ Gateways is a real multi-gateway manager, not a single URL box:
+
+<img src="docs/screens/18-settings-home.png" width="220" alt="Settings home: saved gateway, add button, active base URL and token" align="right" hspace="16"/>
 
 ```mermaid
 stateDiagram-v2
@@ -122,9 +125,10 @@ The watch itself does *not* need Tailscale today — it reaches the tailnet URL 
 when the watch sits on the tailnet (or a router that does). An embedded in-app tsnet node (watch joins
 the tailnet directly, no router help) is specced and deferred; see [SPEC §11.4](docs/SPEC.md).
 
-The Settings screen shows the endpoint list with live probe dots:
+Inside a gateway, the endpoint editor shows the ordered list with live probe dots and the current
+auto-selected winner:
 
-<img src="docs/screens/11-gateways.png" width="220" alt="Gateway endpoints screen: tailnet primary, LAN fallback, auto-selected"/>
+<img src="docs/screens/11-gateways.png" width="220" alt="Endpoint editor: tailnet primary and LAN fallback rows with probe dots"/>
 
 ## Body tools (opt-in, owner-off by default)
 
@@ -145,13 +149,21 @@ Health Services currently exposes heart-rate and steps only — no sleep/SpO2 �
 constants are matched tolerantly (real-world crashes taught us that). On non-Samsung vendors the
 toggles simply report "vendor not available" and everything else keeps working.
 
-Everything about the app — gateways, tokens, toggles, font scale, session — lives on the watch:
+Everything about the app — gateways, tokens, toggles, font scale, session — lives on the watch.
+Every knob is on-device, and there are no hidden ones:
 
-<img src="docs/screens/15-settings-tail.png" width="220" alt="Diagnostics screen: push status, health services, STT model present, TTS ready" align="left" hspace="24"/>
+| | |
+|---|---|
+| <img src="docs/screens/17-agent-picker.png" width="180"/> | <img src="docs/screens/19-settings-display.png" width="180"/> |
+| **Agent switcher** — the watch talks to whichever Hermes profile you pick (one tap switches persona, tools, session space, and base URL together). | **Display settings** — markdown toggle, text scale (`×1.00` + reset), and the pinch affordance documented in one line. |
+| <img src="docs/screens/20-settings-connection.png" width="180"/> | <img src="docs/screens/13-launcher-icon.png" width="180"/> |
+| **Connection editor** — base URL + token (masked at rest, like a password field should be) with a live **Test** button; watchkit config lives right beside it. | **Nothing to install on the phone** — the whole assistant is one icon on the watch's app grid. |
 
 The diagnostics screen is the support story: STT model present ✅, TTS engine ready, last push status
 with bytes and age, health-services availability, location fix state. Location is redacted here for
-the screenshot, honest as you can see — your house shouldn't be in a README.
+the screenshot, honest as you can see — your house shouldn't be in a README:
+
+<img src="docs/screens/15-settings-tail.png" width="220" alt="Diagnostics screen: push status, health services, STT model present, TTS ready"/>
 
 ## Install — let your agent do it
 
@@ -253,7 +265,8 @@ scripts/doctor.sh                          # toolchain + link health report
   served locally by SGLang**. Yes: this app was mostly written by a local model talking to a local
   agent harness, on the same machine it serves the watch from. The build log in
   `docs/SPEC.md` Appendix A is that collaboration's fossil record (including the moment the gateway
-  agent **self-patched its own watch client** to add a cron-brief relay feature — unasked).
+  agent **self-patched its own watch client** to add a feature nobody asked for — and the owner, with
+  final say, deleted it at 11:47 the same morning).
 - Wear Compose 1.4.1, OkHttp + SSE, `androidx.health`, Vosk, nothing else you'd spot in a
   dependency audit.
 
