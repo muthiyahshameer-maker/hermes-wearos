@@ -1,0 +1,29 @@
+# Hermes watchkit — mermaid render + whisper STT helper, tailnet-only :8651.
+# TEMPLATE ONLY — nothing installs this automatically. Copy to enable:
+#   mkdir -p ~/.config/systemd/user
+#   cp server/watchkit/hermes-watchkit.service ~/.config/systemd/user/
+#   # then edit the /PATH/TO placeholders below
+#   systemctl --user daemon-reload && systemctl --user enable --now hermes-watchkit
+#
+# Until you do that, use `scripts/watchkit.sh start` (nohup) instead.
+
+[Unit]
+Description=Hermes watchkit (mermaid render + whisper STT, tailnet :8651)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# /PATH/TO/NODE      -> `command -v node`  (e.g. /usr/local/bin/node)
+# /PATH/TO/REPO      -> absolute path of the hermes-wearos checkout
+WorkingDirectory=/PATH/TO/REPO/server/watchkit
+ExecStart=/PATH/TO/NODE /PATH/TO/REPO/server/watchkit/watchkit.mjs
+Restart=on-failure
+RestartSec=3
+# tailnet bind + token file live in config.json; override via env only if needed:
+# Environment=WATCHKIT_HOST=192.168.1.50 WATCHKIT_PORT=8651
+# hardening is intentionally light: npx + the python venv write under server/watchkit/
+NoNewPrivileges=true
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,101 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature android:name="android.hardware.type.watch" />
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Location tool (owner ask B): fail-soft one-shot fix; NOT required features so the APK
+         still installs on images without GPS. Runtime grant via scripts/watch-health.sh grant. -->
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <uses-feature android:name="android.hardware.location" android:required="false" />
+    <uses-feature android:name="android.hardware.location.gps" android:required="false" />
+    <!-- M5: background-settle + approval notifications (runtime request on API 33+, MainActivity). -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- W1-W4 body tools (SPEC §5): Health Services / Health Platform read permissions.
+         No permission UI in this slice — granted via adb (see scripts/watch-health.sh grant);
+         on Wear these are development-grantable. Unknown-permission declares are ignored at
+         install on images without the Health Platform, so every call stays fail-soft. -->
+    <uses-permission android:name="android.permission.health.READ_HEART_RATE" />
+    <uses-permission android:name="android.permission.health.READ_STEPS" />
+    <uses-permission android:name="android.permission.health.READ_SLEEP" />
+    <uses-permission android:name="android.permission.health.READ_OXYGEN_SATURATION" />
+    <uses-permission android:name="android.permission.health.READ_HEALTH_DATA_IN_BACKGROUND" />
+    <uses-permission android:name="android.permission.health.HEALTH_RECEIVE_HEALTH_SUMMARY" />
+    <uses-permission android:name="android.permission.ACTIVITY_RECOGNITION" />
+    <uses-permission android:name="android.permission.BODY_SENSORS" />
+
+    <application
+        android:name=".WearApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@android:style/Theme.DeviceDefault">
+
+        <!-- Standalone watch app: no companion phone app required. -->
+        <meta-data
+            android:name="com.google.android.wearable.standalone"
+            android:value="true" />
+
+        <!-- singleTask: notification/tile taps reuse the live instance (onNewIntent deep-links).
+             adjustResize (owner batch 2 ask #6): the full-screen prompt editor shares this window,
+             so the system keyboard RESIZES it and the field stays visible above the IME. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTask"
+            android:taskAffinity=""
+            android:windowSoftInputMode="adjustResize"
+            android:theme="@android:style/Theme.DeviceDefault">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- M5: inline Approve/Deny from the approval notification (also adb-testable). -->
+        <receiver
+            android:name=".notify.ApprovalNotificationReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.hermes.wearos.APPROVE" />
+                <action android:name="dev.hermes.wearos.DENY" />
+            </intent-filter>
+        </receiver>
+
+        <!-- M5: "Ask Hermes" tile (SPEC §5 U3): full-screen tap launches talk mode. -->
+        <service
+            android:name=".tile.AskHermesTileService"
+            android:exported="true"
+            android:label="@string/tile_label"
+            android:permission="com.google.android.wearable.permission.BIND_TILE_PROVIDER">
+            <intent-filter>
+                <action android:name="androidx.wear.tiles.action.BIND_TILE_PROVIDER" />
+            </intent-filter>
+        </service>
+
+        <!-- M5: attention complication (SPEC §5 U4): "!" when a chat needs attention, else dot.
+             SHORT_TEXT with a text glyph (no icon asset needed); pushed via
+             ComplicationDataSourceUpdateRequester when attention flips (see notify/Attention.kt). -->
+        <service
+            android:name=".complications.AttentionComplicationService"
+            android:exported="true"
+            android:label="@string/complication_label"
+            android:permission="com.google.android.wearable.permission.BIND_COMPLICATION_PROVIDER">
+            <intent-filter>
+                <action android:name="android.support.wearable.complications.ACTION_COMPLICATION_UPDATE_REQUEST" />
+            </intent-filter>
+            <meta-data
+                android:name="android.support.wearable.complications.SUPPORTED_TYPES"
+                android:value="SHORT_TEXT" />
+            <meta-data
+                android:name="android.support.wearable.complications.UPDATE_PERIOD_SECONDS"
+                android:value="0" />
+        </service>
+    </application>
+
+</manifest>

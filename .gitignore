@@ -1,0 +1,29 @@
+# Gradle / Android
+.gradle/
+local.properties
+*.iml
+.idea/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+app/build/
+build/
+
+# Devkit lives outside the repo (../devkit) — never committed.
+
+# Secrets & local config
+config.json
+config.local.json
+watchos.config.json
+*.keystore
+keystore.properties
+*.jks
+
+# OS/editor noise
+.DS_Store
+*.log
+*.hprof
+
+# watchkit runtime state (latest body snapshot — machine-local, not source)
+server/watchkit/.state/

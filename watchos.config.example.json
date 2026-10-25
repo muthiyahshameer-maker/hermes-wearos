@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to watchos.config.json (gitignored) and fill in — scripts/setup.sh reads it. All values overridable by flags. Endpoints are ordered: first is the DEFAULT entry, the rest are failover fallbacks (SPEC §11).",
+  "gatewayLabel": "hermes",
+  "apiEndpoints": [
+    "http://hermes.tailnet.ts.net:8642",
+    "http://192.168.1.50:8642"
+  ],
+  "watchkitEndpoints": [
+    "http://hermes.tailnet.ts.net:8651",
+    "http://192.168.1.50:8651"
+  ],
+  "token": "REPLACE-with-<API_SERVER_KEY of the wear profile: ~/.hermes/profiles/wear/.env>",
+  "watchkitToken": "",
+  "watchSerial": ""
+}

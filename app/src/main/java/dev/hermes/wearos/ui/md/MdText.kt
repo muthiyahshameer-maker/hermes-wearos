@@ -1,0 +1,390 @@
+package dev.hermes.wearos.ui.md
+
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.unit.dp
+import androidx.wear.compose.material.CircularProgressIndicator
+import androidx.wear.compose.material.MaterialTheme
+import androidx.wear.compose.material.Text
+import dev.hermes.wearos.net.Watchkit
+import dev.hermes.wearos.ui.scaled
+
+/**
+ * Renders [MdBlock]s with Wear Compose MaterialTheme typography ONLY (title1-3 / body1-2 /
+ * caption1-3 / button — no title4+/subtitle; those don't exist in wear-compose 1.x anyway).
+ *
+ * Expand/collapse state is `remember`ed per block key (caller passes a stable `msgId to index`
+ * pair) so it survives recomposition and streaming re-parses but never leaks across blocks.
+ */
+@Composable
+fun MdBlockView(block: MdBlock, blockKey: Any, modifier: Modifier = Modifier) {
+    when (block) {
+        is MdBlock.Heading -> Text(
+            block.spans.annotated(),
+            modifier = modifier.fillMaxWidth().padding(top = 4.dp),
+            style = when (block.level) {
+                1 -> MaterialTheme.typography.title1
+                2 -> MaterialTheme.typography.title2
+                3 -> MaterialTheme.typography.title3
+                else -> MaterialTheme.typography.body1 // h4+ shares body1 bold: no title4 on Wear
+            }.scaled(),
+            fontWeight = FontWeight.Bold,
+        )
+
+        is MdBlock.Paragraph -> Text(
+            block.spans.annotated(),
+            modifier = modifier.fillMaxWidth(),
+            style = MaterialTheme.typography.body2.scaled(),
+        )
+
+        is MdBlock.BulletItem -> Text(
+            block.spans.annotated("•  "),
+            modifier = modifier.fillMaxWidth().padding(start = (block.indent * 8).dp),
+            style = MaterialTheme.typography.body2.scaled(),
+        )
+
+        is MdBlock.NumberedItem -> Text(
+            block.spans.annotated("${block.n}.  "),
+            modifier = modifier.fillMaxWidth(),
+            style = MaterialTheme.typography.body2.scaled(),
+        )
+
+        // Blockquote: caption2 + indent + a leading "│ " bar (cheaper than a canvas line on a round screen).
+        is MdBlock.Quote -> Text(
+            block.spans.annotated("│ "),
+            modifier = modifier.fillMaxWidth().padding(start = 6.dp),
+            style = MaterialTheme.typography.caption2.scaled(),
+            color = MaterialTheme.colors.onBackground.copy(alpha = 0.75f),
+        )
+
+        is MdBlock.CodeBlock -> CodeCard(block.lang, block.code, blockKey, modifier)
+
+        is MdBlock.MermaidFence -> MermaidBlockView(block.code, blockKey, modifier)
+
+        is MdBlock.Image -> ImageBlock(block.alt, block.target, blockKey, modifier)
+
+        is MdBlock.Table -> Column(modifier.fillMaxWidth()) {
+            block.lines.forEach {
+                Text(
+                    it,
+                    modifier = Modifier.fillMaxWidth(),
+                    style = MaterialTheme.typography.caption2.scaled(),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
+
+        // Thin rule: Box+background because wear-compose 1.x has no Divider and
+        // foundation HorizontalDivider only exists from 1.8 (we pin 1.7.6).
+        MdBlock.HrLine -> Box(
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp, vertical = 4.dp)
+                .height(1.dp)
+                .background(MaterialTheme.colors.onBackground.copy(alpha = 0.3f)),
+        )
+    }
+}
+
+/** Whole markdown answer as a column of blocks — one ScalingLazyColumn row per message. */
+@Composable
+fun MdMessage(text: String, msgKey: Any, modifier: Modifier = Modifier) {
+    val blocks = remember(text) { WatchMarkdown.parse(text) }
+    Column(modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp)) {
+        blocks.forEachIndexed { i, b -> MdBlockView(b, msgKey to i) }
+    }
+}
+
+/** Collapsed code: `‹lang› code · tap` + first-line hint; tap → full monospace, h-scroll. */
+@Composable
+private fun CodeCard(lang: String, code: String, blockKey: Any, modifier: Modifier) {
+    var expanded by remember(blockKey) { mutableStateOf(false) }
+    val label = lang.ifBlank { "code" }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colors.surface.copy(alpha = 0.4f))
+            .clickable { expanded = !expanded }
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+    ) {
+        Text(
+            if (expanded) "‹$label› code · tap to collapse" else "‹$label› code · tap",
+            style = MaterialTheme.typography.caption3.scaled(),
+            color = MaterialTheme.colors.primary,
+        )
+        if (expanded) {
+            Text(
+                code,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = 150.dp)
+                    .verticalScroll(rememberScrollState())
+                    .horizontalScroll(rememberScrollState()),
+                style = MaterialTheme.typography.body2.copy(fontFamily = FontFamily.Monospace).scaled(),
+            )
+        } else {
+            val hint = code.lineSequence().firstOrNull { it.isNotBlank() }
+            if (hint != null) Text(
+                hint,
+                modifier = Modifier.fillMaxWidth(),
+                style = MaterialTheme.typography.caption3.copy(fontFamily = FontFamily.Monospace).scaled(),
+                color = MaterialTheme.colors.onBackground.copy(alpha = 0.7f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+/**
+ * F4 watchkit render: first composition POSTs the fence to watchkit /render/mermaid and shows the
+ * returned PNG (server-side mmdc; see server/watchkit). Re-keys on config change so a pushed token
+ * (Settings Test / adb set_watchkit) auto-retries failed blocks. States: spinner-line while the
+ * request is in flight → image card on success → the original placeholder card on ANY error
+ * (401/404/timeout/undecodable), tap-for-source behavior kept. Decodes via LruCache(8) in Watchkit.
+ */
+@Composable
+private fun MermaidBlockView(code: String, blockKey: Any, modifier: Modifier) {
+    val cfg by Watchkit.config.collectAsState()
+    var img by remember(code, cfg) { mutableStateOf<ImageBitmap?>(null) }
+    var failed by remember(code, cfg) { mutableStateOf(false) }
+    LaunchedEffect(code, cfg) {
+        failed = false
+        img = try { Watchkit.renderBitmap(code, width = 460) } catch (e: Exception) { failed = true; null }
+    }
+
+    val bitmap = img
+    if (bitmap != null) {
+        // Pinch-zoom (walkthrough): tapping the rendered diagram opens the full-screen viewer.
+        // (mmdc renders on a white canvas — kept white here, rounded like CodeCard.)
+        var zoomed by remember(blockKey) { mutableStateOf(false) }
+        Box(
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(vertical = 2.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(Color.White)
+                .clickable(onClickLabel = "zoom diagram") { zoomed = true },
+            contentAlignment = Alignment.Center,
+        ) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = "mermaid diagram",
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.widthIn(max = 460.dp),
+            )
+        }
+        if (zoomed) ZoomableMediaViewer(bitmap, caption = "mermaid", onDismiss = { zoomed = false })
+        return
+    }
+
+    if (!failed) {
+        Row(
+            modifier = modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(12.dp),
+                strokeWidth = 2.dp,
+                indicatorColor = MaterialTheme.colors.primary,
+                trackColor = MaterialTheme.colors.surface,
+            )
+            Text(
+                "drawing diagram…",
+                style = MaterialTheme.typography.caption3.scaled(),
+                color = MaterialTheme.colors.onBackground.copy(alpha = 0.7f),
+            )
+        }
+        return
+    }
+
+    // Fallback = the pre-watchkit placeholder card; tap still toggles the source.
+    var showSource by remember(blockKey) { mutableStateOf(false) }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colors.surface.copy(alpha = 0.4f))
+            .clickable { showSource = !showSource }
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+    ) {
+        Text(
+            "📊 diagram (watchkit offline)",
+            modifier = Modifier.fillMaxWidth(),
+            style = MaterialTheme.typography.caption2.scaled(),
+            color = MaterialTheme.colors.primary,
+        )
+        Text(
+            if (showSource) "source · tap to hide" else "tap for source",
+            style = MaterialTheme.typography.caption3.scaled(),
+            color = MaterialTheme.colors.onBackground.copy(alpha = 0.6f),
+        )
+        if (showSource) Text(
+            code,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 150.dp)
+                .verticalScroll(rememberScrollState())
+                .horizontalScroll(rememberScrollState()),
+            style = MaterialTheme.typography.caption3.copy(fontFamily = FontFamily.Monospace).scaled(),
+        )
+    }
+}
+
+/**
+ * F6 inline image (OWNER BATCH 2 — FULL RES): the target is fetched ONCE at full resolution
+ * (watchkit /img serves original bytes), then scaled ON THE WATCH: the card gets a bitmap decoded
+ * down to ~512 px via BitmapFactory inSampleSize (crisp-but-small), while a tap opens the
+ * pinch-zoom viewer on the FULL bitmap (decoded lazily on first zoom, sharing the one fetch —
+ * see Watchkit.fetchImageCard / fetchImageFull, byte-aware LruCache). Re-keys on config change
+ * like MermaidBlockView, so a pushed token auto-retries failed blocks. States: caption
+ * placeholder → rounded bitmap card → on ANY error (403/404/offline/undecodable) a caption card
+ * with alt + short error, tap reveals the target text.
+ */
+@Composable
+private fun ImageBlock(alt: String, target: String, blockKey: Any, modifier: Modifier) {
+    val cfg by Watchkit.config.collectAsState()
+    var img by remember(target, cfg) { mutableStateOf<ImageBitmap?>(null) }
+    var err by remember(target, cfg) { mutableStateOf<String?>(null) }
+    LaunchedEffect(target, cfg) {
+        err = null
+        img = try {
+            Watchkit.fetchImageCard(target)
+        } catch (e: Exception) {
+            err = (e.message ?: "fetch failed").take(90); null
+        }
+    }
+
+    val bitmap = img
+    if (bitmap != null) {
+        // Pinch-zoom: tap opens the full-screen viewer; the FIRST zoom decodes the full-res
+        // bitmap from the shared bytes (the card bitmap shows while it loads, then swaps —
+        // deep zoom stays sharp because the pixels are the original ones).
+        var zoomed by remember(blockKey) { mutableStateOf(false) }
+        Box(
+            modifier = modifier
+                .fillMaxWidth()
+                .padding(vertical = 2.dp)
+                .clip(RoundedCornerShape(8.dp))
+                .background(MaterialTheme.colors.surface.copy(alpha = 0.25f))
+                .clickable(onClickLabel = "zoom image") { zoomed = true },
+            contentAlignment = Alignment.Center,
+        ) {
+            Image(
+                bitmap = bitmap,
+                contentDescription = alt.ifBlank { "image" },
+                contentScale = ContentScale.Fit,
+                modifier = Modifier.widthIn(max = 440.dp),
+            )
+        }
+        if (zoomed) {
+            var full by remember(blockKey) { mutableStateOf<ImageBitmap?>(null) }
+            LaunchedEffect(Unit) { full = try { Watchkit.fetchImageFull(target) } catch (e: Exception) { null } }
+            ZoomableMediaViewer(full ?: bitmap, caption = alt, onDismiss = { zoomed = false })
+        }
+        return
+    }
+
+    if (err == null) {
+        Text(
+            if (alt.isBlank()) "loading image…" else "loading image… · $alt",
+            modifier = modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+            style = MaterialTheme.typography.caption3.scaled(),
+            color = MaterialTheme.colors.onBackground.copy(alpha = 0.7f),
+        )
+        return
+    }
+
+    // Error card: alt + short reason; tap toggles the raw target (like mermaid's tap-for-source).
+    var showTarget by remember(blockKey) { mutableStateOf(false) }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colors.surface.copy(alpha = 0.4f))
+            .clickable { showTarget = !showTarget }
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+    ) {
+        Text(
+            alt.ifBlank { "image" },
+            modifier = Modifier.fillMaxWidth(),
+            style = MaterialTheme.typography.caption2.scaled(),
+            color = MaterialTheme.colors.primary,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Text(
+            err + " · tap " + if (showTarget) "to hide target" else "for target",
+            style = MaterialTheme.typography.caption3.scaled(),
+            color = MaterialTheme.colors.onBackground.copy(alpha = 0.6f),
+        )
+        if (showTarget) Text(
+            target,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 100.dp)
+                .verticalScroll(rememberScrollState())
+                .horizontalScroll(rememberScrollState()),
+            style = MaterialTheme.typography.caption3.copy(fontFamily = FontFamily.Monospace).scaled(),
+        )
+    }
+}
+
+private fun List<MdSpan>.annotated(prefix: String = ""): AnnotatedString =
+    buildAnnotatedString {
+        if (prefix.isNotEmpty()) append(prefix)
+        appendSpans(this@annotated)
+    }
+
+private fun androidx.compose.ui.text.AnnotatedString.Builder.appendSpans(spans: List<MdSpan>) {
+    for (s in spans) when (s) {
+        is MdSpan.Plain -> append(s.text)
+        is MdSpan.Bold -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { appendSpans(s.children) }
+        is MdSpan.Italic -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { appendSpans(s.children) }
+        is MdSpan.InlineCode -> withStyle(
+            SpanStyle(fontFamily = FontFamily.Monospace, background = androidx.compose.ui.graphics.Color.White.copy(alpha = 0.12f)),
+        ) { append(s.text) }
+    }
+}

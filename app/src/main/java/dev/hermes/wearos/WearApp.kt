@@ -1,0 +1,452 @@
+package dev.hermes.wearos
+
+import android.app.Application
+import android.os.Bundle
+import android.util.Log
+import dev.hermes.wearos.data.AgentsRepo
+import dev.hermes.wearos.data.AppSettings
+import dev.hermes.wearos.data.ChatStore
+import dev.hermes.wearos.domain.ChatSession
+import dev.hermes.wearos.domain.ProfileLogic
+import dev.hermes.wearos.health.BodySnapshot
+import dev.hermes.wearos.health.BodyTools
+import dev.hermes.wearos.location.LocationTool
+import dev.hermes.wearos.notify.Attention
+import dev.hermes.wearos.notify.Notifs
+import dev.hermes.wearos.net.HermesApi
+import dev.hermes.wearos.net.EndpointResolver
+import dev.hermes.wearos.net.SnapshotPusher
+import dev.hermes.wearos.net.Watchkit
+import dev.hermes.wearos.voice.SpeakAloud
+import dev.hermes.wearos.voice.VoskStt
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.plus
+
+class WearApp : Application() {
+    override fun onCreate() {
+        super.onCreate()
+        Graph.init(this)
+    }
+
+    /** App-wide singletons; M5: foreground gate for notifications + attention/complication push. */
+    object Graph {
+        private const val TAG = "HermesWear"
+        private val scope = CoroutineScope(SupervisorJob())
+        lateinit var app: Application
+            private set
+        lateinit var settings: AppSettings
+            private set
+        lateinit var store: ChatStore
+            private set
+        lateinit var session: ChatSession
+            private set
+        lateinit var speak: SpeakAloud
+            private set
+        lateinit var pusher: SnapshotPusher
+            private set
+        lateinit var stt: VoskStt
+            private set
+        lateinit var agents: AgentsRepo
+            private set
+
+        /** Gateway endpoint failover (SPEC §11): winner tracking + probe triggers. */
+        lateinit var endpoints: EndpointResolver
+            private set
+        fun hasEndpoints(): Boolean = ::endpoints.isInitialized
+
+        /** Label of the selected gateway (agent-dialog header + Settings badge). */
+        private val _gatewayLabel = MutableStateFlow("")
+        val gatewayLabel: kotlinx.coroutines.flow.StateFlow<String> = _gatewayLabel
+
+        /** Gateway list mirror for the Settings UI (re-read after every registry mutation). */
+        private val _gatewayList = MutableStateFlow<List<dev.hermes.wearos.domain.Gateway>>(emptyList())
+        val gatewayList: kotlinx.coroutines.flow.StateFlow<List<dev.hermes.wearos.domain.Gateway>> = _gatewayList
+        private val _gatewaySelectedId = MutableStateFlow("")
+        val gatewaySelectedId: kotlinx.coroutines.flow.StateFlow<String> = _gatewaySelectedId
+
+        private suspend fun refreshGatewayMirror() {
+            _gatewayList.value = settings.gateways()
+            _gatewaySelectedId.value = settings.selectedGatewayId()
+            _gatewayLabel.value = settings.selectedGateway()?.label ?: ""
+        }
+
+        /** Re-read the UI mirrors after Settings edited base/token directly (they fold into the list). */
+        fun refreshMirrorFromSettings() {
+            if (!::settings.isInitialized) return
+            scope.launch { refreshGatewayMirror() }
+        }
+
+        /** Dev hook (`-e ptt_demo "text"`): forces the PTT overlay with a fake partial for shots. */
+        val devPtt = MutableStateFlow<String?>(null)
+
+        /**
+         * Dev hook (`-e fontscale <v>`): persist + apply the pinch font-scale over adb — the
+         * screenshot path for d2/d5 (a two-finger pinch is not reachable via adb on the watch).
+         * Non-numeric values reset to 1.0 (same as the double-tap transcript reset).
+         */
+        fun devSetFontScale(v: String) {
+            scope.launch { settings.setFontScale(v.toFloatOrNull() ?: dev.hermes.wearos.domain.FontScale.DEFAULT) }
+        }
+
+        /**
+         * Dev hook (`-e viewer_demo [scale]`): opens the MEDIA VIEWER on a generated test card —
+         * the sub-fit zoom-out proof (d3) over adb; the optional float opens it BELOW fit directly
+         * (single-pointer adb input can't pinch). null = closed (tap / ✕ closes it like the real
+         * viewer).
+         */
+        val devViewerScale = MutableStateFlow<Float?>(null)
+
+        /**
+         * Dev hook (`-e open_editor "text"`): opens the prompt editor prefilled — the system
+         * keyboard proof for owner batch 2 (works over adb on the physical watch, no tap needed).
+         * MainActivity consumes (nulls it back after opening).
+         */
+        val devEditor = MutableStateFlow<String?>(null)
+
+        /**
+         * MAIN-THREAD GATE for every UI callback (walkthrough crash, 2a32c65):
+         * `java.lang.NullPointerException: Can't toast on a thread that has not called
+         * Looper.prepare()` at MainActivity switchAgent toast — because Graph's scope is
+         * `CoroutineScope(SupervisorJob())` with NO dispatcher, `scope.launch { … }` in
+         * ChatSession (switchAgent / refreshGatewaySessions / resumeGatewaySession …) runs on
+         * Dispatchers.Default, and callbacks fired from there land on a worker thread where
+         * Toast.show() is fatal. REGRESSION GUARD: any callback handed to session/agents that
+         * touches Toast/labels/navigation MUST wrap its body in `Graph.runOnUi { … }`.
+         * (Audit 2026-10-24: switchAgent.onDone is the only UI-touching callback — the other
+         * callback consumers are Log.i (thread-safe) and goAsync.finish (thread-safe).)
+         */
+        private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+        fun runOnUi(block: () -> Unit) {
+            if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) block()
+            else mainHandler.post(block)
+        }
+
+        /**
+         * True while any activity is RESUMED (ActivityLifecycleCallbacks counter). Used to gate
+         * notifications: a settled answer or approval request that the user can already see on
+         * screen must not buzz. tile/complication/receiver processes read it as false — correct,
+         * nothing is visible there.
+         */
+        @Volatile
+        var isForeground = false
+            private set
+        private var resumedActivities = 0
+
+        fun init(app: Application) {
+            if (!::settings.isInitialized) {
+                this.app = app
+                Notifs.ensureChannels(app)
+                app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
+                    override fun onActivityResumed(activity: android.app.Activity) {
+                        resumedActivities++
+                        isForeground = true
+                    }
+
+                    override fun onActivityStopped(activity: android.app.Activity) {
+                        resumedActivities = (resumedActivities - 1).coerceAtLeast(0)
+                        isForeground = resumedActivities > 0
+                    }
+
+                    override fun onActivityCreated(activity: android.app.Activity, savedInstanceState: Bundle?) {}
+                    override fun onActivityStarted(activity: android.app.Activity) {}
+                    override fun onActivityPaused(activity: android.app.Activity) {}
+                    override fun onActivitySaveInstanceState(activity: android.app.Activity, outState: Bundle) {}
+                    override fun onActivityDestroyed(activity: android.app.Activity) {}
+                })
+                settings = AppSettings(app)
+                store = ChatStore(settings, app, scope + SupervisorJob())
+                session = ChatSession(settings, store, scope + SupervisorJob(), app)
+                // W8 body tools: Health Services probe/collection + watchkit snapshot cadence.
+                BodyTools.init(app, scope + SupervisorJob())
+                pusher = SnapshotPusher(settings, scope + SupervisorJob(), app)
+                pusher.start()
+                // M2 voice: TTS must be created on the main thread (Application.onCreate is main).
+                speak = SpeakAloud(app, settings, scope + SupervisorJob())
+                speak.init()
+                scope.launch { speak.loadEnabled() }
+                scope.launch { settings.loadMarkdownRendering() } // Display ▸ markdown (F3 default ON)
+                scope.launch { settings.loadFontScale() } // pinch font-scale (Layout D epic)
+                scope.launch { settings.loadBodyTools() } // W1-W4: body switches (all default OFF)
+                scope.launch { Watchkit.setConfig(settings.mermaidBaseUrl(), settings.watchkitToken()) } // F4/watchkit
+                agents = AgentsRepo(settings)
+                // GATEWAY SYSTEM (owner epic, SPEC §11): registry seed/migration from the legacy
+                // keys, then endpoint failover for the selected gateway. The winner callback
+                // rewrites the legacy mirror keys + Watchkit config so every existing consumer
+                // (ChatSession/pusher/sessions/agents) rides the winner with zero changes.
+                endpoints = EndpointResolver(settings) { gw, api, wk ->
+                    settings.syncMirror(api, wk, gw.token)
+                    Watchkit.setConfig(wk.ifEmpty { AppSettings.DEFAULT_WATCHKIT_URL }, settings.watchkitToken())
+                }
+                // Queued AFTER Watchkit.setConfig so the first /agents fetch carries the real token.
+                scope.launch {
+                    val gw = settings.ensureGateways() // one-time seed/migrate (never loses old keys)
+                    settings.loadProfile()
+                    if (gw != null) { endpoints.bind(gw); endpoints.ensure(false) } // background probe: tailnet-first
+                    refreshGatewayMirror()
+                    agents.loadCache()
+                    agents.refresh()
+                }
+                stt = VoskStt(app)
+                session.resume() // loads registry (migrates legacy keys), restores active chat + in-flight run
+                // Attention bit → complication prefs + requestUpdateAll (single hook, SPEC §5 U4).
+                scope.launch { store.chats.collect { chats -> Attention.publish(app, chats.any { it.pendingAttention }) } }
+            }
+        }
+
+        /** Chat opened/foregrounded: clear its flag + notifications (M5 U1/U4 "cleared on open"). */
+        fun clearAttention(chatId: String) {
+            if (chatId.isEmpty() || !::store.isInitialized) return
+            store.get(chatId)?.let { meta ->
+                if (meta.pendingAttention) {
+                    android.util.Log.i("HermesWear", "attention cleared chat=$chatId")
+                    store.update(chatId) { it.copy(pendingAttention = false) }
+                }
+                Notifs.cancelChat(app, chatId, meta.lastRunId)
+            }
+        }
+
+        /** Dev-only (adb): store the gateway token before the pairing flow ships (S5). */
+        fun setToken(token: String) {
+            scope.launch { settings.setToken(token) }
+        }
+
+        /** Dev-only (adb): point the app at a LAN endpoint (🏠 path) before mDNS discovery ships. */
+        fun setBase(url: String) {
+            scope.launch { settings.setBaseUrl(url) }
+        }
+
+        // ─── GATEWAY OPS (SPEC §11) ────────────────────────────────────────────────────────
+        // Row tap = SELECT: re-probe the new gateway's endpoint list (force), reload chats for
+        // the current agent through the SAME switchAgent plumbing (its onDone lands on a worker
+        // thread — toasting callers must use Graph.runOnUi, the 2a32c65 crash gate).
+
+        fun selectGateway(id: String, onDone: (ok: Boolean, label: String, error: String) -> Unit = { _, _, _ -> }) {
+            scope.launch {
+                val gw = settings.gateways().firstOrNull { it.id == id }
+                if (gw == null) { onDone(false, "", "no gateway '$id'"); return@launch }
+                settings.setSelectedGatewayId(id)
+                endpoints.rebind(gw)
+                endpoints.ensure(force = true)          // re-probes tailnet/LAN order for THIS gateway
+                settings.syncMirror(endpoints.currentApi(), endpoints.currentWatchkit(), gw.token)
+                settings.loadProfile()                  // rebuild /p/ segment on the fresh mirror
+                _gatewayLabel.value = gw.label
+                session.switchAgent(settings.savedAgent()) { ok, base, err ->
+                    Log.i(TAG, "gateway selected id=$id label='${gw.label}' ok=$ok base=$base err=$err")
+                }
+                agents.refresh()
+                session.refreshGatewaySessions()
+                refreshGatewayMirror()
+                onDone(true, gw.label, "")
+            }
+        }
+
+        /** Upsert from the Settings editor; re-probes immediately when the EDITED gateway is selected. */
+        fun saveGateway(gw: dev.hermes.wearos.domain.Gateway, onDone: (error: String) -> Unit = {}) {
+            scope.launch {
+                try {
+                    val wasSelected = settings.selectedGatewayId() == gw.id
+                    settings.saveGateway(gw, select = gw.id == settings.selectedGatewayId())
+                    val sel = settings.selectedGateway()
+                    if (wasSelected && sel != null) {
+                        endpoints.rebind(sel)
+                        endpoints.ensure(force = true)
+                        settings.syncMirror(endpoints.currentApi(), endpoints.currentWatchkit(), sel.token)
+                        settings.loadProfile()
+                    }
+                    refreshGatewayMirror()
+                    agents.refresh()
+                    Log.i(TAG, "gateway saved id=${gw.id} label='${gw.label}' api=${gw.apiEndpoints}")
+                    onDone("")
+                } catch (e: Exception) {
+                    Log.w(TAG, "gateway save failed: ${e.message}")
+                    onDone(e.message ?: "save failed")
+                }
+            }
+        }
+
+        fun deleteGateway(id: String, onDone: (ok: Boolean) -> Unit = {}) {
+            scope.launch {
+                val sel = settings.deleteGateway(id)
+                if (sel != null) {
+                    endpoints.rebind(sel)
+                    endpoints.ensure(force = true)
+                    settings.syncMirror(endpoints.currentApi(), endpoints.currentWatchkit(), sel.token)
+                    settings.loadProfile()
+                }
+                refreshGatewayMirror()
+                agents.refresh()
+                Log.i(TAG, "gateway deleted id=$id remaining=${_gatewayList.value.size}")
+                onDone(sel != null || _gatewayList.value.isEmpty())
+            }
+        }
+
+        /** Dev-only (adb `-e gw_dump`): registry + winner state in logcat. */
+        fun devGwDump() {
+            scope.launch {
+                val list = settings.gateways()
+                Log.i(TAG, "gw_dump selected=${settings.selectedGatewayId()} n=${list.size}")
+                list.forEach {
+                    Log.i(TAG, "gw_dump gateway id=${it.id} label='${it.label}' api=${it.apiEndpoints} wk=${it.watchkitEndpoints} token.len=${it.token.length}")
+                }
+                if (hasEndpoints()) {
+                    val s = endpoints.status.value
+                    Log.i(TAG, "gw_dump winner api=${s.apiWinner} wk=${s.watchkitWinner} results=${s.apiResults}")
+                }
+                Log.i(TAG, "gw_dump mirror base=${settings.baseUrl()} wk=${settings.mermaidBaseUrl()} token.len=${settings.token().length}")
+            }
+        }
+
+        /** Dev-only (adb `-e gw_select <id>`): select + forced re-probe (screenshot-free proof). */
+        fun devGwSelect(id: String) = selectGateway(id) { ok, label, err ->
+            Log.i(TAG, "gw_select ok=$ok id=$id label='$label' err=$err")
+        }
+
+        /** Dev-only (adb `-e gw_probe`): force the failover probe round; winner goes to logcat. */
+        fun devGwProbe() {
+            scope.launch {
+                val api = endpoints.ensure(force = true)
+                Log.i(TAG, "gw_probe done api=$api winner=${endpoints.status.value.apiWinner} wk=${endpoints.status.value.watchkitWinner}")
+            }
+        }
+
+        fun setWatchkitBase(url: String) {
+            scope.launch { settings.setMermaidBaseUrl(url) }
+        }
+
+        /** Dev-only (adb `-e set_watchkit`): store watchkit token + push config so renders retry. */
+        fun setWatchkitToken(token: String) {
+            scope.launch {
+                settings.setWatchkitToken(token)
+                Watchkit.setConfig(settings.mermaidBaseUrl(), token)
+                android.util.Log.i("HermesWear", "watchkit token set (len=${token.length}) url=${settings.mermaidBaseUrl()}")
+            }
+        }
+
+        /** Dev-only (adb `-e render_test`): one watchkit render round-trip, result in logcat. */
+        fun devRenderTest() {
+            Thread {
+                try {
+                    val bytes = kotlinx.coroutines.runBlocking { Watchkit.renderBytes("digraph{a->b}") }
+                    android.util.Log.i("HermesWear", "render ok bytes=${bytes.size}")
+                } catch (e: Exception) {
+                    android.util.Log.e("HermesWear", "render err ${e.message}")
+                }
+            }.start()
+        }
+
+        /** Dev-only (adb `-e img_test`): one watchkit /img round-trip — FULL-RES path (no width). */
+        fun devImgTest() {
+            Thread {
+                try {
+                    val bytes = kotlinx.coroutines.runBlocking {
+                        Watchkit.fetchImageBytes("/home/user/.hermes/wear-img-test-full.png", width = 0)
+                    }
+                    val bmp = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        ?: throw IllegalStateException("png decode failed")
+                    android.util.Log.i("HermesWear", "img_test ok bytes=${bytes.size} px=${bmp.width}x${bmp.height} (full-res)")
+                } catch (e: Exception) {
+                    android.util.Log.e("HermesWear", "img_test err ${e.message}")
+                }
+            }.start()
+        }
+
+        /** Dev-only (adb `-e body_status`): Health Services probe; per-tool results in logcat. */
+        fun devBodyStatus() {
+            Thread {
+                val st = kotlinx.coroutines.runBlocking { BodyTools.probe() }
+                android.util.Log.i("HermesWear", "body_status ── health services ──")
+                st.forEach { (k, v) -> android.util.Log.i("HermesWear", "body_status $k -> $v") }
+                val snap = kotlinx.coroutines.runBlocking {
+                    BodySnapshot.buildJson(
+                        System.currentTimeMillis(), chatActive = false,
+                        BodySnapshot.Toggles(true, true, true, true, true), BodyTools.values(),
+                    )
+                }
+                android.util.Log.i("HermesWear", "body_status snapshot(if all on) $snap")
+            }.start()
+        }
+
+        /** Dev-only (adb `-e body_push`): force one snapshot push to watchkit. */
+        fun devBodyPush() = pusher.pushNow("adb")
+
+        /** Dev-only (adb `-e agents_list`): refresh + log the agent list (switcher source of truth). */
+        fun devAgentsList() {
+            scope.launch {
+                val list = agents.refresh()
+                android.util.Log.i(
+                    "HermesWear",
+                    "agents_list n=${list.size} fallback=${agents.usingFallback()} current=${settings.profileSync()} list=$list",
+                )
+            }
+        }
+
+        /** Dev-only (adb `-e agent <name>`): switch gateway agent (base-URL /p/ swap + chat list). */
+        fun devAgent(name: String) = session.switchAgent(name) { ok, base, err ->
+            android.util.Log.i("HermesWear", "agent_switch ok=$ok name=$name base=$base err=$err")
+        }
+
+        /** Dev-only (adb `-e sessions_dump`): gateway session list + watch-ownership markers. */
+        fun devSessionsDump() {
+            Thread {
+                try {
+                    val base = kotlinx.coroutines.runBlocking { settings.baseUrl() }
+                    val token = kotlinx.coroutines.runBlocking { settings.token() }
+                    val list = devHttpSessions(base, token)
+                    android.util.Log.i("HermesWear", "sessions_dump base=$base n=${list.size}")
+                    list.forEach {
+                        android.util.Log.i(
+                            "HermesWear",
+                            "sessions_dump id=${it.id} watch=${ProfileLogic.isWatchSession(it.id)} msgs=${it.messages} " +
+                                "activeMs=${it.lastActiveMs} title='${it.title.take(60)}'",
+                        )
+                    }
+                } catch (e: Exception) {
+                    android.util.Log.e("HermesWear", "sessions_dump err ${e.message}")
+                }
+            }.start()
+        }
+
+        private fun devHttpSessions(base: String, token: String) =
+            kotlinx.coroutines.runBlocking(kotlinx.coroutines.Dispatchers.IO) {
+                HermesApi(base, token).listSessions()
+            }
+
+        /** Dev-only (adb `-e resume_session <id>`, optional `-e resume_profile <p>`): adopt a
+         *  gateway session (M4 resume proof + history-backfill proof — profile mirrors the
+         *  Sessions-screen row tag so the backfill probe targets the right state.db). */
+        fun devResumeSession(id: String, profile: String = "") {
+            android.util.Log.i("HermesWear", "resume_session id=$id profile=$profile")
+            session.resumeGatewaySession(id, "", profile)
+        }
+
+        /** Dev-only (adb `-e stop_mid_run [text]`): ask, wait 1.5 s, STOP — logcat: stream ceased. */
+        fun devStopMidRun(text: String) {
+            Thread {
+                try {
+                    session.ask(text)
+                    Thread.sleep(1_500)
+                    session.stopActiveRun()
+                    android.util.Log.i("HermesWear", "stop_test: stop fired at 1.5s (see 'stop:' lines above)")
+                } catch (e: Exception) {
+                    android.util.Log.e("HermesWear", "stop_test err ${e.message}")
+                }
+            }.start()
+        }
+
+        /** Dev-only (adb `-e loc_status`): location tool perms + providers + last-fix outcome. */
+        fun devLocStatus() {
+            Thread {
+                val line = LocationTool.statusLine(app)
+                android.util.Log.i("HermesWear", "loc_status ── $line")
+                val fix = LocationTool.probe(app)
+                android.util.Log.i(
+                    "HermesWear",
+                    "loc_status probe -> ${fix?.let { LocationTool.formatFix(it, System.currentTimeMillis()) } ?: "no fix"} status='${LocationTool.status.value}'",
+                )
+            }.start()
+        }
+    }
+}

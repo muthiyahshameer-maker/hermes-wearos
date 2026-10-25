@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Dev-only: inject an ask from adb so M1 is testable without typing on the watch.
+         Usage: adb shell am broadcast -a dev.hermes.wearos.ASK -e text "hello from adb" -->
+    <application>
+        <receiver
+            android:name="dev.hermes.wearos.DevAskReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.hermes.wearos.ASK" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

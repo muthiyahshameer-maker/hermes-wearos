@@ -1,0 +1,184 @@
+package dev.hermes.wearos.domain
+
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Endpoint failover state machine (SPEC §11) driven by a FAKE prober + FAKE clock: the exact
+ * home scenario — tailnet endpoint first, dead until timeout; LAN answers; winner is remembered;
+ * primary gets its short-backoff retry; mid-session failures advance the list.
+ */
+class FailoverTest {
+
+    private val tailnet = "http://hermes.tailnet.ts.net:8642"
+    private val lan = "http://192.168.1.50:8642"
+    private val endpoints = listOf(tailnet, lan)
+
+    private class Fake(val name: String) : Exception(name)
+
+    /** JVM shim: run the suspend ensure() with its fake probe right here. */
+    private fun Failover.go(force: Boolean = false, probe: suspend (String) -> Boolean): String? =
+        kotlinx.coroutines.runBlocking { ensure(force, probe) }
+
+    private fun machine(
+        eps: List<String> = endpoints,
+        now: () -> Long = { 1_000_000L },
+        reprobeMs: Long = Failover.DEFAULT_REPROBE_MS,
+        primaryRetryMs: Long = Failover.DEFAULT_PRIMARY_RETRY_MS,
+    ) = Failover(eps, reprobeMs, primaryRetryMs, now)
+
+    @Test
+    fun `fresh machine points at primary without probing`() {
+        var probes = 0
+        val f = machine(now = { 0L })
+        assertEquals(endpoints, f.probeOrder(0L))
+        assertTrue(f.needsProbe(0L))
+        val winner = f.go { probes++; false }
+        assertEquals(2, probes) // full round, in order
+        assertNull(winner)      // all dead: nothing to remember
+        assertEquals(tailnet, f.effective()) // primary stands as the pointer anyway
+        assertTrue(f.lastResult.values.all { it == false })
+    }
+
+    @Test
+    fun `tailnet dead lan alive at home - lan wins after one fast failure`() {
+        val probed = mutableListOf<String>()
+        val f = machine(now = { 0L })
+        val winner = f.go { url -> probed += url; url == lan }
+        assertEquals(lan, winner)
+        assertEquals(listOf(tailnet, lan), probed) // advance order = endpoint order
+        assertEquals(lan, f.effective())
+        assertTrue(f.describe().contains("primary"))
+        assertTrue(f.describe().contains("down"))
+    }
+
+    @Test
+    fun `winner is sticky - ensure within ttl never touches the network`() {
+        var probes = 0
+        var now = 0L
+        val f = machine(now = { now })
+        assertEquals(lan, f.go { probes++; it == lan })
+        assertEquals(2, probes)
+        now = 10_000L // well inside reprobe + primary-retry windows
+        assertEquals(lan, f.go { probes++; true })
+        assertEquals("sticky winner must not re-probe", 2, probes)
+        assertFalse(f.needsProbe(now))
+    }
+
+    @Test
+    fun `after backoff primary is retried once - still dead keeps fallback and re-arms backoff`() {
+        var now = 0L
+        val probed = mutableListOf<String>()
+        val f = Failover(endpoints, clock = { now })
+        // Home scenario: fallback wins at t=0.
+        assertEquals(lan, f.go { url -> probed += url; url == lan })
+        assertEquals(listOf(tailnet, lan), probed)
+        // Within backoff: no retry churn.
+        now = 30_000L
+        assertFalse(f.needsProbe(now))
+        // Backoff elapsed (60 s): primary gets ONE probe first.
+        now = 61_000L
+        assertTrue(f.needsProbe(now))
+        probed.clear()
+        assertEquals(lan, f.go { url -> probed += url; url == lan })
+        assertEquals("primary must be retried first", tailnet, probed.first())
+        // Still dead: primary re-armed for another window — next cycle probes it once more,
+        // and the LAN winner is found WITHOUT re-probing the whole list.
+        probed.clear()
+        now = 122_000L
+        assertEquals(lan, f.go { url -> probed += url; url == lan })
+        assertEquals(listOf(tailnet, lan), probed)
+    }
+
+    @Test
+    fun `primary recovery - winner flips back and retry timer clears`() {
+        var now = 0L
+        var tailnetUp = false
+        val f = Failover(endpoints, clock = { now })
+        assertEquals(lan, f.go { url -> url == lan })
+        now = 61_000L
+        tailnetUp = true
+        assertEquals(tailnet, f.go { url -> url == tailnet })
+        assertEquals(tailnet, f.effective())
+        // Healthy primary: no retry pressure until the long revalidation ttl.
+        assertFalse(f.needsProbe(now + 1_000))
+        assertFalse(f.describe().contains("down"))
+    }
+
+    @Test
+    fun `mid-session failure on the winner dethrones and next ensure advances on`() {
+        val probed = mutableListOf<String>()
+        val f = machine(now = { 0L })
+        // Winner is tailnet (it answers now)…
+        assertEquals(tailnet, f.go { url -> url == tailnet })
+        // …then the socket dies mid-chat (SPEC §11 advance-on-timeout).
+        f.reportNetworkFailure(tailnet, now = 5_000L)
+        assertNull(f.winner)
+        val next = f.go { url -> probed += url; url == lan }
+        assertEquals(lan, next)
+        assertEquals(listOf(tailnet, lan), probed) // ordered advance
+    }
+
+    @Test
+    fun `non-winner failure does not disturb a healthy winner`() {
+        val f = machine(now = { 0L })
+        f.onSuccess(lan, now = 0L)
+        f.onFailure(tailnet, now = 0L) // the dead primary recorded for the dots
+        assertEquals(lan, f.winner)
+        assertEquals(mapOf(lan to true, tailnet to false), f.lastResult)
+    }
+
+    @Test
+    fun `all endpoints dead keeps the previous winner standing`() {
+        var now = 0L
+        val f = Failover(endpoints, clock = { now })
+        assertEquals(lan, f.go { url -> url == lan })
+        // Later everything is down (VPN flap, gateway restart storm):
+        now = 400_000L // past reprobe ttl
+        val kept = f.go { false }
+        assertEquals("stale pointer beats a null one", lan, kept)
+        assertFalse(f.isWinner(tailnet))
+    }
+
+    @Test
+    fun `force ensure always re-probes and can move the winner`() {
+        var up = lan
+        val f = machine(now = { 0L })
+        assertEquals(lan, f.go { url -> url == up })
+        up = tailnet
+        assertEquals(tailnet, f.go(force = true) { url -> url == up })
+        assertEquals(tailnet, f.winner)
+    }
+
+    @Test
+    fun `empty endpoint list is inert`() {
+        val f = machine(eps = emptyList(), now = { 0L })
+        assertEquals("", f.effective())
+        assertEquals(emptyList<String>(), f.probeOrder(0L))
+        assertNull(f.go { throw Fake("must not probe") })
+        assertFalse(f.needsProbe(0L))
+    }
+
+    @Test
+    fun `resolve probe exception counts as failure and advances`() {
+        val probed = mutableListOf<String>()
+        val f = machine(now = { 0L })
+        val winner = f.go { url -> probed += url; if (url == tailnet) throw Fake("timeout"); true }
+        assertEquals(lan, winner)
+        assertEquals(listOf(tailnet, lan), probed)
+    }
+
+    @Test
+    fun `three endpoints - advance walks the list to the third`() {
+        val vps = "http://vps.example.com:8642"
+        val f = machine(eps = endpoints + vps, now = { 0L })
+        val winner = f.go { url -> url == vps }
+        assertEquals(vps, winner)
+        // Primary-retry order after backoff keeps list order for the rest:
+        assertEquals(listOf(tailnet, lan, vps), f.probeOrder(61_000L))
+    }
+}

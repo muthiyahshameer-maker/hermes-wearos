@@ -1,0 +1,6 @@
+# watchkit local artifacts — nothing here is ever committed
+config.json
+.cache/
+.models/
+.venv/
+.watchkit.pid

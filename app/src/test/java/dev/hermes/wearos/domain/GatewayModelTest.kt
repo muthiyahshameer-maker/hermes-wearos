@@ -1,0 +1,216 @@
+package dev.hermes.wearos.domain
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Gateway registry (SPEC §11): seed defaults (tailnet first), legacy-key migration, CRUD with
+ * selection fixups, JSON round-trip, and the base-URL/token folds. Pure — mirrors exactly what
+ * AppSettings persists.
+ */
+class GatewayModelTest {
+
+    @Test
+    fun `seed puts tailnet first lan second`() {
+        val g = GatewayModel.seed("tok")
+        assertEquals(GatewayModel.SEED_ID, g.id)
+        assertEquals("hermes", g.label)
+        assertEquals(
+            listOf("http://hermes.tailnet.ts.net:8642", "http://192.168.1.50:8642"),
+            g.apiEndpoints,
+        )
+        assertEquals(
+            listOf("http://hermes.tailnet.ts.net:8651", "http://192.168.1.50:8651"),
+            g.watchkitEndpoints,
+        )
+        assertEquals("tok", g.token)
+    }
+
+    @Test
+    fun `normalizeEndpoint strips profile segment trailing slash and whitespace`() {
+        assertEquals("http://h:8642", GatewayModel.normalizeEndpoint("http://h:8642/p/wear"))
+        assertEquals("http://h:8642", GatewayModel.normalizeEndpoint("  http://h:8642/p/wear/  "))
+        assertEquals("http://h:8642", GatewayModel.normalizeEndpoint("http://h:8642/"))
+        assertEquals("http://h:8642", GatewayModel.normalizeEndpoint("http://h:8642"))
+        assertEquals("", GatewayModel.normalizeEndpoint("   "))
+        // A path that isn't a profile segment stays intact (never mangle unknown routes).
+        assertEquals("http://h:8642/api", GatewayModel.normalizeEndpoint("http://h:8642/api"))
+    }
+
+    @Test
+    fun `apiBase re-derives the profile segment`() {
+        assertEquals("http://h:8642/p/wear", GatewayModel.apiBase("http://h:8642/p/wear", "wear"))
+        assertEquals("http://h:8642/p/default", GatewayModel.apiBase("http://h:8642/", "default"))
+        // Invalid profile → endpoint stands (caller keeps old behavior; no hardcoding).
+        assertEquals("http://h:8642", GatewayModel.apiBase("http://h:8642", ""))
+        assertEquals("", GatewayModel.apiBase("", "wear"))
+    }
+
+    @Test
+    fun `encode decode roundtrip and garbage decodes empty`() {
+        val list = listOf(GatewayModel.seed("k"), Gateway("vps", "vps", listOf("http://v:8642"), listOf("http://v:8651"), "t"))
+        val back = GatewayModel.decode(GatewayModel.encode(list))
+        assertEquals(list, back)
+        assertTrue(GatewayModel.decode("").isEmpty())
+        assertTrue(GatewayModel.decode("{not json").isEmpty())
+        assertTrue(GatewayModel.decode("[]").isEmpty())
+    }
+
+    @Test
+    fun `migrate fresh install seeds tailnet first`() {
+        val (list, selected) = GatewayModel.migrate("", "", "")
+        assertEquals(listOf(GatewayModel.seed("")), list)
+        assertEquals(GatewayModel.SEED_ID, selected)
+    }
+
+    @Test
+    fun `migrate stock default base url keeps tailnet-first order and migrates token`() {
+        val (list, selected) = GatewayModel.migrate("http://hermes.tailnet.ts.net:8642/p/wear", "SECRET", "http://hermes.tailnet.ts.net:8651")
+        assertEquals(GatewayModel.SEED_ID, selected)
+        val g = list.single()
+        assertEquals(GatewayModel.DEFAULT_API_ENDPOINTS, g.apiEndpoints) // tailnet FIRST, LAN second
+        assertEquals(GatewayModel.DEFAULT_WATCHKIT_ENDPOINTS, g.watchkitEndpoints)
+        assertEquals("SECRET", g.token)
+    }
+
+    @Test
+    fun `pre-publication stock urls still migrate as untouched`() {
+        // Pre-publication builds shipped the author's own box as the stock default; watches
+        // installed back then must STILL migrate (not be treated as custom hosts). Split
+        // literals: byte-identical to those old defaults, free of the original machine name.
+        val legacyIp = "http://100" + ".69.144" + ".33"
+        val (list, selected) = GatewayModel.migrate("$legacyIp:8642/p/wear", "SECRET", "$legacyIp:8651")
+        assertEquals(GatewayModel.SEED_ID, selected)
+        assertEquals(GatewayModel.DEFAULT_API_ENDPOINTS, list.single().apiEndpoints)
+        assertEquals("SECRET", list.single().token)
+        val legacyIdentity = "http://tux" + "desktop" + ".tail" + "b12aa5.ts.net"
+        val legacyLan = "http://192" + ".168" + ".10" + ".62"
+        for (u in listOf("$legacyIdentity:8642/p/wear", "$legacyLan:8642/p/wear")) {
+            val (l2, s2) = GatewayModel.migrate(u, "K", "")
+            assertEquals(GatewayModel.SEED_ID, s2)
+            assertEquals(GatewayModel.DEFAULT_API_ENDPOINTS, l2.single().apiEndpoints)
+        }
+    }
+
+    @Test
+    fun `migrate from explicit LAN still lands tailnet-first at home defaults`() {
+        val (list, _) = GatewayModel.migrate("http://192.168.1.50:8642/p/wear", "K", "")
+        val g = list.single()
+        assertEquals(listOf(GatewayModel.TAILNET_API, GatewayModel.LAN_API), g.apiEndpoints)
+    }
+
+    @Test
+    fun `migrate custom host keeps its endpoint first and derives watchkit`() {
+        val (list, selected) = GatewayModel.migrate("http://vps.example.com:8642/p/wear", "VK", "")
+        val g = list.single()
+        assertEquals(selected, g.id)
+        assertEquals("vps-example-com", g.id)
+        assertEquals(
+            listOf("http://vps.example.com:8642", GatewayModel.TAILNET_API, GatewayModel.LAN_API),
+            g.apiEndpoints,
+        )
+        assertTrue(g.watchkitEndpoints.first().startsWith("http://vps.example.com:8651"))
+        assertEquals("VK", g.token)
+    }
+
+    @Test
+    fun `migrate custom watchkit url leads the watchkit order and dedupes`() {
+        val (list, _) = GatewayModel.migrate("http://vps.example.com:8642/p/wear", "", "http://vps.example.com:8651")
+        val g = list.single()
+        assertEquals("http://vps.example.com:8651", g.watchkitEndpoints.first())
+        assertEquals(g.watchkitEndpoints.size, g.watchkitEndpoints.distinct().size)
+    }
+
+    @Test
+    fun `migrate keeps custom watchkit url when api is stock`() {
+        val (list, _) = GatewayModel.migrate("http://192.168.1.50:8642/p/wear", "", "http://other.box:9999")
+        val g = list.single()
+        assertEquals(GatewayModel.DEFAULT_API_ENDPOINTS, g.apiEndpoints)
+        assertEquals("http://other.box:9999", g.watchkitEndpoints.first())
+    }
+
+    @Test
+    fun `upsert replaces by id and appends new`() {
+        val seed = listOf(GatewayModel.seed("a"))
+        val edited = GatewayModel.upsert(seed, GatewayModel.SEED_ID.let { Gateway(it, "renamed", listOf("http://new:8642"), listOf(), "b") })
+        assertEquals(1, edited.size)
+        assertEquals("renamed", edited[0].label)
+        assertEquals("b", edited[0].token)
+        val two = GatewayModel.upsert(edited, Gateway("vps", "vps", listOf("http://v:8642"), listOf(), ""))
+        assertEquals(2, two.size)
+        assertEquals(listOf(GatewayModel.SEED_ID, "vps"), two.map { it.id })
+    }
+
+    @Test
+    fun `upsert sanitizes endpoints and defaults label from host`() {
+        val list = GatewayModel.upsert(emptyList(), Gateway("g", "  ", listOf(" http://h:8642/p/wear ", "http://h:8642", "  "), listOf(), "  "))
+        val g = list.single()
+        assertEquals(listOf("http://h:8642"), g.apiEndpoints) // normalize + dedupe + drop blanks
+        assertEquals("g", g.label) // blank label falls back to id
+    }
+
+    @Test
+    fun `upsert rejects gateway without api endpoint`() {
+        var threw = false
+        try { GatewayModel.upsert(emptyList(), Gateway("g", "g", emptyList(), emptyList(), "")) } catch (e: IllegalArgumentException) { threw = true }
+        assertTrue(threw)
+    }
+
+    @Test
+    fun `remove + selectedAfterRemove fixup`() {
+        val a = GatewayModel.seed("")
+        val b = Gateway("vps", "vps", listOf("http://v:8642"), listOf(), "")
+        val list = listOf(a, b)
+        assertEquals("vps", GatewayModel.selectedAfterRemove(a.id, list, a.id)) // next survivor
+        assertEquals(a.id, GatewayModel.selectedAfterRemove(a.id, list, b.id)) // untouched
+        assertEquals("", GatewayModel.selectedAfterRemove(b.id, listOf(b), b.id)) // empties out
+        assertEquals(listOf(b), GatewayModel.remove(list, a.id))
+    }
+
+    @Test
+    fun `foldBaseUrl prepends unknown endpoint but never reorders known ones`() {
+        val seed = listOf(GatewayModel.seed(""))
+        // Failover winner / agent switch re-sets base_url with an endpoint already on the list:
+        // order MUST stand (owner: tailnet default entry, LAN fallback).
+        val foldedLan = GatewayModel.foldBaseUrl(seed, GatewayModel.SEED_ID, "http://192.168.1.50:8642/p/wear")
+        assertEquals(GatewayModel.DEFAULT_API_ENDPOINTS, foldedLan.single().apiEndpoints)
+        // User types a brand-new host: that becomes the primary entry.
+        val foldedNew = GatewayModel.foldBaseUrl(seed, GatewayModel.SEED_ID, "http://new.host:8642/p/wear")
+        assertEquals(
+            listOf("http://new.host:8642", GatewayModel.TAILNET_API, GatewayModel.LAN_API),
+            foldedNew.single().apiEndpoints,
+        )
+        // No selection / junk URL: list stands.
+        assertEquals(seed, GatewayModel.foldBaseUrl(seed, "ghost", "http://x:1/p/wear"))
+        assertEquals(seed, GatewayModel.foldBaseUrl(seed, GatewayModel.SEED_ID, ""))
+    }
+
+    @Test
+    fun `foldToken lands on the selected gateway only`() {
+        val list = listOf(GatewayModel.seed("old"), Gateway("vps", "vps", listOf("http://v:8642"), listOf(), "keep"))
+        val folded = GatewayModel.foldToken(list, GatewayModel.SEED_ID, " new ")
+        assertEquals("new", folded[0].token)
+        assertEquals("keep", folded[1].token)
+    }
+
+    @Test
+    fun `derivedWatchkit and hostId handle ports hosts and junk`() {
+        assertEquals("http://a.b:8651", GatewayModel.derivedWatchkit("http://a.b:8642"))
+        assertEquals("http://a.b:8651", GatewayModel.derivedWatchkit("http://a.b:8642/p/wear"))
+        assertEquals("http://10.0.0.9:8651", GatewayModel.derivedWatchkit("http://10.0.0.9"))
+        assertEquals("", GatewayModel.derivedWatchkit("nonsense"))
+        assertEquals("vps-example-com", GatewayModel.hostId("http://vps.example.com:8642/p/wear"))
+        assertEquals("gateway", GatewayModel.hostId("://"))
+    }
+
+    @Test
+    fun `primary accessors survive empty lists`() {
+        val g = Gateway("x", "x", emptyList(), emptyList(), "")
+        assertEquals("", g.primaryApi)
+        assertEquals("", g.primaryWatchkit)
+        assertFalse(GatewayModel.decode(GatewayModel.encode(listOf(GatewayModel.seed("t")))).isEmpty())
+    }
+}
